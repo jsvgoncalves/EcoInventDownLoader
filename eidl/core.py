@@ -12,22 +12,30 @@ from bw2io import SingleOutputEcospold2Importer, bw2setup
 from bw2data import projects, databases
 
 from eidl.storage import eidlstorage
+from eidl.settings import Settings
 
 
 class EcoinventDownloader:
     def __init__(self, username=None, password=None, version=None,
-                 system_model=None, outdir=None, **kwargs):
-        self.username = username
-        self.password = password
-        self.version = version
-        self.system_model = system_model
-        self.outdir = outdir
+                 system_model=None, outdir=None, store_download=True, **kwargs):
+        settings = Settings()
+        self.username = username or settings.username
+        self.password = password or settings.password.get_secret_value() if settings.password else None
+        self.version = version or settings.version
+        self.system_model = system_model or settings.system_model
+        self.outdir = outdir or settings.output_path
+        self.store_download = store_download
+        if self.username is None or self.password is None:
+            self.username, self.password = self.get_credentials()
+        self.post_download_hook = lambda path, filename: (path, filename)
 
     def run(self):
         if self.check_stored():
             return
+
         self.login()
         print('login successful!')
+
         if (self.version, self.system_model) not in self.db_dict.keys():
             self.version, self.system_model = self.choose_db()
         if self.check_stored():
@@ -95,7 +103,10 @@ class EcoinventDownloader:
             return False
 
     def get_credentials(self):
-        un = input('ecoinvent username: ')
+        if not self.username:
+            un = input('ecoinvent username: ')
+        else:
+            un = self.username
         pw = getpass.getpass('ecoinvent password: ')
         return un, pw
 
@@ -211,22 +222,36 @@ class EcoinventDownloader:
         db_num = db_version.replace('.', '')
         return f'https://v{db_num}.ecoquery.ecoinvent.org/Details/PDF/{pdf_id}'
 
+    def _get_pdf_url(self, db_version, pdf_id):
+        db_num = db_version.replace('.', '')
+        return f'https://v{db_num}.ecoquery.ecoinvent.org/Details/PDF/{pdf_id}'
+
     def download(self):
-        url = 'https://v38.ecoquery.ecoinvent.org'
-        db_key = (self.version, self.system_model)
-        try:
-            file_content = self.session.get(url + self.db_dict[db_key], timeout=60).content
-        except (requests.ConnectTimeout, requests.ReadTimeout, requests.ConnectionError) as e:
-            self.handle_connection_timeout()
-            raise e
+        with tempfile.TemporaryDirectory() as td:
+            download_path = self.outdir
+            if download_path is None:
+                if self.store_download:
+                    download_path = eidlstorage.eidl_dir
+                else:
+                    download_path = td
 
-        if self.outdir:
-            self.out_path = os.path.join(self.outdir, self.file_name)
-        else:
-            self.out_path = os.path.join(os.path.abspath('.'), self.file_name)
 
-        with open(self.out_path, 'wb') as out_file:
-            out_file.write(file_content)
+            url = 'https://v38.ecoquery.ecoinvent.org'
+            db_key = (self.version, self.system_model)
+            try:
+                file_content = self.session.get(url + self.db_dict[db_key], timeout=60).content
+            except (requests.ConnectTimeout, requests.ReadTimeout, requests.ConnectionError) as e:
+                self.handle_connection_timeout()
+                raise e
+
+            self.out_path = os.path.join(download_path, self.file_name)
+
+            with open(self.out_path, 'wb') as out_file:
+                out_file.write(file_content)
+
+            self.extract(target_dir=download_path)
+
+            self.post_download_hook(download_path, self.file_name)
 
     def extract(self, target_dir, **kwargs):
         extract_cmd = ['py7zr', 'x', self.out_path, target_dir]
@@ -245,7 +270,7 @@ class EcoinventDownloader:
         self.version, self.system_model = self.get_db_sui(spdx)
 
 
-def get_ecoinvent(db_name=None, auto_write=False, outdir=None, store_download=True, **kwargs):
+def get_ecoinvent(db_name=None, auto_write=False, outdir=None, download_path=None, store_download=True, **kwargs):
     """
     Download and import ecoinvent to current brightway2 project
     Args:
@@ -263,25 +288,24 @@ def get_ecoinvent(db_name=None, auto_write=False, outdir=None, store_download=Tr
         version: ecoinvent version (string), eg '3.5'
         system_model: ecoinvent system model (string), one of {'cutoff', 'apos', 'consequential'}
     """
-    with tempfile.TemporaryDirectory() as td:
-        if outdir is None:
-            if store_download:
-                outdir = eidlstorage.eidl_dir
-            else:
-                outdir = td
+    downloader = EcoinventDownloader(outdir=download_path, store_download=store_download, **kwargs)
+    importer = None
+    downloader.login()
+    downloader.db_dict = downloader.get_available_files()
 
-        downloader = EcoinventDownloader(outdir=outdir, **kwargs)
-        downloader.login()
-        downloader.db_dict = downloader.get_available_files()
+    def process_file(path, file_name):
+        nonlocal importer
+        nonlocal db_name
+
         if db_name:
             downloader.set_with_spdx(db_name)
-        downloader.run()
-        downloader.extract(target_dir=outdir)
-
         if not db_name:
             db_name = f'ei-{downloader.version}-{downloader.system_model}'
-        datasets_path = os.path.join(outdir, 'datasets')
+        datasets_path = os.path.join(path, 'datasets')
         importer = SingleOutputEcospold2Importer(datasets_path, db_name)
+
+    downloader.post_download_hook = process_file
+    downloader.run()
 
     if 'biosphere3' not in databases:
         if auto_write:
